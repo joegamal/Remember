@@ -7,13 +7,13 @@ public interface ICatalogRepository
 {
     Catalog Data { get; }
     Study? Find(string id);
-    JsonElement[] FlexSample { get; }
+    JsonElement FlexSample { get; }
 }
 
 public sealed class CatalogRepository : ICatalogRepository
 {
     public Catalog Data { get; }
-    public JsonElement[] FlexSample { get; }
+    public JsonElement FlexSample { get; }
 
     public CatalogRepository()
     {
@@ -36,8 +36,7 @@ public sealed class CatalogRepository : ICatalogRepository
             if (study.RelevanceReasons.Values.Any(r => r.EvidenceIds.Any(id => !study.Evidence.Any(e => e.Id == id))))
                 throw new InvalidDataException("Relevance evidence is missing.");
         }
-        FlexSample = JsonSerializer.Deserialize<JsonElement[]>(File.ReadAllText(Path.Combine(directory, "flex_verified_sample.json")))
-            ?? throw new InvalidDataException("FLEX sample is empty.");
+        FlexSample = JsonSerializer.Deserialize<JsonElement>(File.ReadAllText(Path.Combine(directory, "flex_verified_sample.json")));
     }
 
     public Study? Find(string id) => Data.Investigations.FirstOrDefault(s => s.Id == id);

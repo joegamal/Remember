@@ -2,7 +2,7 @@ using OrbitFlame.Api.Contracts;
 
 namespace OrbitFlame.Api.Services;
 
-public sealed class ResearchService(ICatalogRepository catalog)
+public sealed class ResearchService(ICatalogRepository catalog, KnowledgeService knowledge)
 {
     public static readonly Dictionary<string, string> Topics = new()
     {
@@ -14,15 +14,23 @@ public sealed class ResearchService(ICatalogRepository catalog)
     };
     public static bool ValidTopic(string topic) => Topics.ContainsKey(topic);
 
-    public RankedStudy[] Rank(string topic, string family, string query, string material, string variable)
+    public async Task<RankedStudy[]> Rank(string topic, string family, string query, string material, string variable, CancellationToken cancellationToken = default)
     {
         var source = catalog.Data.Investigations.AsEnumerable();
         if (!string.IsNullOrEmpty(family)) source = source.Where(s => s.FuelFamily == family);
         if (!string.IsNullOrWhiteSpace(material)) source = source.Where(s => s.Materials.Any(m => Contains(m, material)));
-        if (!string.IsNullOrWhiteSpace(query)) source = source.Where(s => Contains(string.Join(' ',
-            new[] { s.ShortName, s.Title, s.Summary }.Concat(s.Materials).Concat(s.Variables)), query));
-        // Detection is an explicit coverage gap, not an inferred use of SPICE.
+        // Detection results require explicit catalog coverage.
         if (topic == "detection") source = source.Where(s => s.ResearchTopics.Contains(topic));
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            var available = source.ToArray();
+            if (available.Length == 0) return [];
+            var hits = await knowledge.SearchAsync(query, available.Select(s => s.Id).ToArray(), 80, cancellationToken);
+            return available.Select(study => new { study, hits = hits.Where(h => h.InvestigationIds.Contains(study.Id)).Take(3).ToArray() })
+                .Where(x => x.hits.Length > 0).OrderByDescending(x => x.hits[0].Score + .05 * x.hits.Skip(1).Sum(h => h.Score))
+                .Select(x => new RankedStudy(x.study, topic == "all" || x.study.ResearchTopics.Contains(topic),
+                    ["Relevant passages from the original sources match your query.", x.hits[0].Evidence.Location], x.hits.Select(h => h.Evidence).ToArray(), x.hits[0].Score)).ToArray();
+        }
         return source.Select(s => new
         {
             Study = s,

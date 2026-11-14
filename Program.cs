@@ -1,194 +1,151 @@
-using System.ComponentModel;
 using System.Threading.RateLimiting;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.OpenApi;
 using OrbitFlame.Api.Contracts;
-using OrbitFlame.Api.Data;
 using OrbitFlame.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
-
-
+builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false);
+// Parse only known local settings. Never execute .env content or log values.
+var envPath = Path.Combine(builder.Environment.ContentRootPath, "..", "..", ".env");
+if (File.Exists(envPath))
+{
+    var local = new Dictionary<string, string?>();
+    foreach (var raw in File.ReadLines(envPath))
+    {
+        var line = raw.Trim(); if (line.StartsWith("export ", StringComparison.Ordinal)) line = line[7..].Trim();
+        if (line.Length == 0 || line.StartsWith('#')) continue; var equal = line.IndexOf('='); if (equal < 1) continue;
+        var name = line[..equal].Trim(); var value = line[(equal + 1)..].Trim();
+        if (value.Length >= 2 && ((value[0] == '"' && value[^1] == '"') || (value[0] == '\'' && value[^1] == '\''))) value = value[1..^1];
+        var setting = name switch { "Gemini_API" or "GEMINI_API_KEY" or "Gemini__ApiKey" => "Gemini:ApiKey", "GEMINI_MODEL" or "Gemini__Model" => "Gemini:Model", "groq" or "GROQ_API_KEY" or "Groq__ApiKey" => "Groq:ApiKey", "GROQ_MODEL" or "Groq__Model" => "Groq:Model", "LLM_PROVIDER" => "Llm:Provider", _ => null };
+        if (setting is not null) local[setting] = value;
+    }
+    builder.Configuration.AddInMemoryCollection(local);
+}
+builder.Configuration.AddEnvironmentVariables();
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 16_384);
-
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlServer(builder.Configuration.GetConnectionString("OrbitFlame")
-        ?? "Server=(localdb)\\MSSQLLocalDB;Database=OrbitFlame;Trusted_Connection=True;TrustServerCertificate=True"));
-
 builder.Services.AddSingleton<ICatalogRepository, CatalogRepository>();
 builder.Services.AddSingleton<ResearchService>();
+builder.Services.AddSingleton<DataPaths>();
+builder.Services.AddSingleton<DatasetService>();
+builder.Services.AddSingleton<EmbeddingService>();
 builder.Services.AddSingleton<KnowledgeService>();
+builder.Services.AddSingleton<PageService>();
 builder.Services.AddHttpClient<ExplanationService>();
-
-
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy => policy
     .WithOrigins(builder.Configuration.GetSection("Cors:Origins").Get<string[]>() ?? [])
     .AllowAnyHeader().AllowAnyMethod()));
-
-
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
     options.AddPolicy("explanations", context => RateLimitPartition.GetFixedWindowLimiter(
         context.Connection.RemoteIpAddress?.ToString() ?? "local", _ => new FixedWindowRateLimiterOptions
-        { PermitLimit = 12, Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
+        { PermitLimit = Math.Clamp(builder.Configuration.GetValue("Generation:RequestsPerMinute", 12), 1, 240), Window = TimeSpan.FromMinutes(1), QueueLimit = 0 }));
 });
-
-
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen(options => options.SwaggerDoc("v1", new OpenApiInfo
-{
-    Title = "OrbitFlame API",
-    Version = "v1",
-    Description = "Explore, compare, and ask evidence-grounded questions about the NASA FLEX, BASS, BASS-II, "
-        + "and SPICE combustion investigations. Relevance ranking measures fit to a research topic, not fire danger. "
-        + "AI routes return labeled retrieved or curated evidence when no model provider is configured."
-}));
-
 var app = builder.Build();
 // Fail early if the published catalog or its provenance is invalid.
 _ = app.Services.GetRequiredService<ICatalogRepository>();
 _ = app.Services.GetRequiredService<KnowledgeService>();
 app.UseCors();
 app.UseRateLimiter();
-app.UseSwagger();
-app.UseSwaggerUI(options =>
+// Private configuration is never a public resource, even if copied into wwwroot by mistake.
+app.Use(async (context, next) =>
 {
-    options.SwaggerEndpoint("/swagger/v1/swagger.json", "OrbitFlame API v1");
-    options.DocumentTitle = "OrbitFlame API documentation";
+    var segments = context.Request.Path.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) ?? [];
+    if (segments.Any(segment => segment.Equals(".git", StringComparison.OrdinalIgnoreCase)
+        || segment.Equals(".env", StringComparison.OrdinalIgnoreCase)
+        || segment.StartsWith(".env.", StringComparison.OrdinalIgnoreCase)
+        || segment.StartsWith("appsettings", StringComparison.OrdinalIgnoreCase) && segment.EndsWith(".json", StringComparison.OrdinalIgnoreCase)))
+    {
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+        return;
+    }
+    await next(context);
 });
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
-app.MapGet("/api/health", (ICatalogRepository catalog) => Results.Ok(new HealthResponse(
-        "ok", catalog.Data.Version, catalog.Data.Investigations.Length)))
-    .WithTags("System")
-    .WithName("GetHealth")
-    .WithSummary("Check service health")
-    .WithDescription("Returns the API status, catalog version, and number of investigations in the catalog.")
-    .Produces<HealthResponse>(StatusCodes.Status200OK);
-app.MapGet("/api/documents", (KnowledgeService knowledge) => Results.Ok(new DocumentListResponse(
-        knowledge.Data.Documents.Select(d => new DocumentSummary(d.Id, d.Title, d.InvestigationIds, d.SourceUrl)).ToArray(),
-        knowledge.Data.Passages.Length)))
-    .WithTags("Documents")
-    .WithName("ListDocuments")
-    .WithSummary("List indexed reports")
-    .WithDescription("Returns metadata for the reports indexed for passage retrieval, plus the total passage count. "
-        + "BASS has catalog evidence but no indexed report.")
-    .Produces<DocumentListResponse>(StatusCodes.Status200OK);
-app.MapGet("/api/documents/{id}/file", ([Description("Document identifier from GET /api/documents.")] string id,
-        KnowledgeService knowledge) =>
+app.MapGet("/api/health", (ICatalogRepository catalog, KnowledgeService knowledge) => Results.Ok(new
+{ status = "ok", catalogVersion = catalog.Data.Version, studies = catalog.Data.Investigations.Length, retrieval = knowledge.RetrievalStatus }));
+app.MapGet("/api/documents", (KnowledgeService knowledge) => Results.Ok(new
+{ documents = knowledge.Data.Documents.Select(d => new { d.Id, d.Title, d.InvestigationIds, d.SourceUrl }), passages = knowledge.Data.Passages.Length }));
+app.MapGet("/api/documents/{id}/file", (string id, KnowledgeService knowledge, DataPaths paths) =>
+{
+    var doc = knowledge.Data.Documents.FirstOrDefault(d => d.Id == id);
+    return doc is null ? Results.NotFound() : Results.File(paths.Document(doc.FileName),
+        "application/pdf", enableRangeProcessing: true);
+});
+app.MapGet("/api/meta", (ICatalogRepository catalog) => Results.Ok(new
+{
+    topics = ResearchService.Topics.Select(t => new { id = t.Key, label = t.Value }),
+    catalog.Data.SourceAuditDate,
+    catalog.Data.UpdatedOn,
+    catalog.Data.CoverageGaps,
+    rankingMeaning = "Relevance to your research need, not a fire-danger score."
+}));
+app.MapGet("/api/investigations", async (string? topic, string? fuelFamily, string? q, string? material, string? variable,
+    ResearchService research, ICatalogRepository catalog, KnowledgeService knowledge, CancellationToken cancellationToken) =>
+{
+    topic ??= "all";
+    if (!ResearchService.ValidTopic(topic) || (fuelFamily is not null and not ("" or "solid" or "droplet" or "gas_jet" or "heated_materials"))
+        || new[] { q, material, variable }.Any(s => s?.Length > 1000))
+        return Results.BadRequest(new { error = "Invalid topic, fuel family, or search value (maximum 1000 characters)." });
+    var rows = await research.Rank(topic, fuelFamily ?? "", q ?? "", material ?? "", variable ?? "", cancellationToken);
+    return Results.Ok(new
     {
-        var doc = knowledge.Data.Documents.FirstOrDefault(d => d.Id == id);
-        return doc is null ? Results.NotFound() : Results.File(Path.Combine(AppContext.BaseDirectory, "Data", "Documents", doc.FileName),
-            "application/pdf", enableRangeProcessing: true);
-    })
-    .WithTags("Documents")
-    .WithName("DownloadDocument")
-    .WithSummary("Download an indexed report PDF")
-    .WithDescription("Streams the original NASA report PDF. HTTP range requests are supported for page-level citations.")
-    .Produces(StatusCodes.Status200OK, contentType: "application/pdf")
-    .Produces(StatusCodes.Status404NotFound);
-app.MapGet("/api/meta", (ICatalogRepository catalog) => Results.Ok(new MetaResponse(
-        ResearchService.Topics.Select(t => new TopicSummary(t.Key, t.Value)).ToArray(),
-        catalog.Data.SourceAuditDate, catalog.Data.UpdatedOn, catalog.Data.CoverageGaps,
-        "Relevance to your research need, not a fire-danger score.")))
-    .WithTags("Catalog")
-    .WithName("GetMetadata")
-    .WithSummary("Get research topics and catalog metadata")
-    .WithDescription("Lists supported research topics, source audit and update dates, explicit coverage gaps, "
-        + "and an explanation of what relevance ranking means.")
-    .Produces<MetaResponse>(StatusCodes.Status200OK);
-app.MapGet("/api/investigations", ([Description("Research topic: all, material_flammability, suppression, smoke_formation, or detection. Defaults to all.")] string? topic,
-        [Description("Fuel family filter: solid, droplet, or gas_jet. Omit for all families.")] string? fuelFamily,
-        [Description("Free-text search over short name, title, summary, materials, and variables. Maximum 120 characters.")] string? q,
-        [Description("Material name filter. Maximum 120 characters.")] string? material,
-        [Description("Variable name filter. Maximum 120 characters.")] string? variable,
-        ResearchService research, ICatalogRepository catalog) =>
-    {
-        topic ??= "all";
-        if (!ResearchService.ValidTopic(topic) || (fuelFamily is not null and not ("" or "solid" or "droplet" or "gas_jet"))
-            || new[] { q, material, variable }.Any(s => s?.Length > 120))
-            return Results.BadRequest(new ApiError("Invalid topic, fuel family, or search value (maximum 120 characters)."));
-        var rows = research.Rank(topic, fuelFamily ?? "", q ?? "", material ?? "", variable ?? "");
-        return Results.Ok(new InvestigationListResponse(rows, rows.Length, catalog.Data.Investigations.Length,
-            catalog.Data.SourceAuditDate, catalog.Data.CoverageGaps));
-    })
-    .WithTags("Investigations")
-    .WithName("ListInvestigations")
-    .WithSummary("List and rank investigations")
-    .WithDescription("Filters the catalog by research topic, fuel family, material, and variable, then ranks matches "
-        + "by relevance to the selected topic and search terms. Relevance order is not a fire-danger score.")
-    .Produces<InvestigationListResponse>(StatusCodes.Status200OK)
-    .Produces<ApiError>(StatusCodes.Status400BadRequest);
-app.MapGet("/api/investigations/{id}", ([Description("Investigation identifier, for example PSI-69.")] string id,
-        ICatalogRepository catalog) =>
-        catalog.Find(id) is { } study ? Results.Ok(study) : Results.NotFound(new ApiError("Investigation not found.")))
-    .WithTags("Investigations")
-    .WithName("GetInvestigation")
-    .WithSummary("Get one investigation")
-    .WithDescription("Returns a study with its evidence, relevance reasons, limitations, and data availability notes.")
-    .Produces<Study>(StatusCodes.Status200OK)
-    .Produces<ApiError>(StatusCodes.Status404NotFound);
-app.MapGet("/api/experiments/flex", (ICatalogRepository catalog) => Results.Ok(new FlexSampleResponse(
-        catalog.FlexSample,
-        "12 source-checked transcriptions. Descriptive only; unresolved conditions prevent controlled comparisons.")))
-    .WithTags("Experiments")
-    .WithName("GetFlexSample")
-    .WithSummary("Get the reviewed FLEX sample")
-    .WithDescription("Returns the 12 reviewed FLEX records and a scope note. The rows are descriptive transcriptions, "
-        + "not independent experimental sample sizes.")
-    .Produces<FlexSampleResponse>(StatusCodes.Status200OK);
+        investigations = rows,
+        total = rows.Length,
+        totalCatalog = catalog.Data.Investigations.Length,
+        sourceAuditDate = catalog.Data.SourceAuditDate,
+        coverageGaps = catalog.Data.CoverageGaps,
+        retrieval = knowledge.RetrievalStatus
+    });
+});
+app.MapGet("/api/datasets", (DatasetService datasets) => Results.Ok(new { datasets = datasets.Summary }));
+app.MapGet("/api/datasets/{id}", (string id, DatasetService datasets) => datasets.Find(id) is { } dataset
+    ? Results.Ok(new { dataset, assets = datasets.Assets(id) }) : Results.NotFound(new { error = "Dataset not found." }));
+app.MapGet("/api/datasets/{id}/assets/{assetId}", (string id, string assetId, DatasetService datasets) => datasets.Asset(id,assetId) is { } file
+    ? Results.File(file.Path, "application/octet-stream", file.Name, enableRangeProcessing:true) : Results.NotFound(new { error = "Original asset is not available locally." }));
+app.MapGet("/api/investigations/{id}", (string id, ICatalogRepository catalog) =>
+    catalog.Find(id) is { } study ? Results.Ok(study) : Results.NotFound(new { error = "Investigation not found." }));
+app.MapGet("/api/experiments/flex", (ICatalogRepository catalog) => Results.Ok(new
+{
+    records = catalog.FlexSample,
+    scope = "12 source-checked transcriptions. Descriptive only; unresolved conditions prevent controlled comparisons."
+}));
 app.MapPost("/api/compare", (SelectionRequest request, ResearchService research) =>
-    {
-        try { return Results.Ok(research.Compare(research.Select(request), request.ResearchTopic ?? "all")); }
-        catch (ArgumentException error) { return Results.BadRequest(new ApiError(error.Message)); }
-    })
-    .WithTags("Comparisons")
-    .WithName("CompareInvestigations")
-    .WithSummary("Compare two or three investigations")
-    .WithDescription("Builds a deterministic, field-by-field comparison of two or three distinct known investigations. "
-        + "The result compares research scope and available evidence; it does not pool experiments or predict outcomes.")
-    .Produces<Comparison>(StatusCodes.Status200OK)
-    .Produces<ApiError>(StatusCodes.Status400BadRequest);
+{
+    try { return Results.Ok(research.Compare(research.Select(request), request.ResearchTopic ?? "all")); }
+    catch (ArgumentException error) { return Results.BadRequest(new { error = error.Message }); }
+});
 app.MapPost("/api/explain", async (SelectionRequest request, ResearchService research,
-        ExplanationService explanation, CancellationToken cancellationToken) =>
-    {
-        try { return Results.Ok(await explanation.Explain(research.Select(request), request.ResearchTopic ?? "all", cancellationToken)); }
-        catch (ArgumentException error) { return Results.BadRequest(new ApiError(error.Message)); }
-    })
-    .WithTags("Explanations")
-    .WithName("ExplainComparison")
-    .WithSummary("Explain a comparison")
-    .WithDescription("Returns an explanation of the selected investigations. Generated sections are validated against "
-        + "known evidence; when generation is unavailable the response is labeled retrieved, curated, or insufficient_evidence. "
-        + "Rate-limited to 12 requests per minute per client IP.")
-    .RequireRateLimiting("explanations")
-    .Produces<Explanation>(StatusCodes.Status200OK)
-    .Produces<ApiError>(StatusCodes.Status400BadRequest)
-    .Produces(StatusCodes.Status429TooManyRequests);
+    ExplanationService explanation, CancellationToken cancellationToken) =>
+{
+    try { return Results.Ok(await explanation.Explain(research.Select(request), request.ResearchTopic ?? "all", cancellationToken)); }
+    catch (ArgumentException error) { return Results.BadRequest(new { error = error.Message }); }
+}).RequireRateLimiting("explanations");
 app.MapPost("/api/ask", async (QuestionRequest request, ICatalogRepository catalog,
-        ExplanationService explanation, CancellationToken cancellationToken) =>
-    {
-        if (string.IsNullOrWhiteSpace(request.Question) || request.Question.Trim().Length < 8 || request.Question.Length > 1000
-            || (request.InvestigationIds is { } ids && (ids.Length > 3 || ids.Any(id => catalog.Find(id) is null) || ids.Distinct().Count() != ids.Length)))
-            return Results.BadRequest(new ApiError("Enter a question of 8–1000 characters and up to three known study IDs."));
-        return Results.Ok(await explanation.Ask(request.Question.Trim(), request.InvestigationIds ?? [], cancellationToken));
-    })
-    .WithTags("Explanations")
-    .WithName("AskQuestion")
-    .WithSummary("Ask an evidence question")
-    .WithDescription("Retrieves relevant report passages and optionally generates an answer grounded in those passages. "
-        + "Questions must be 8–1000 characters; up to three unique known study IDs may constrain retrieval. "
-        + "Rate-limited to 12 requests per minute per client IP.")
-    .RequireRateLimiting("explanations")
-    .Produces<Explanation>(StatusCodes.Status200OK)
-    .Produces<ApiError>(StatusCodes.Status400BadRequest)
-    .Produces(StatusCodes.Status429TooManyRequests);
+    ExplanationService explanation, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Question) || request.Question.Trim().Length < 8 || request.Question.Length > 1000
+        || (request.InvestigationIds is { } ids && (ids.Length > 3 || ids.Any(id => catalog.Find(id) is null) || ids.Distinct().Count() != ids.Length)))
+        return Results.BadRequest(new { error = "Enter a question of 8–1000 characters and up to three known study IDs." });
+    return Results.Ok(await explanation.Ask(request.Question.Trim(), request.InvestigationIds ?? [], cancellationToken));
+}).RequireRateLimiting("explanations");
+app.MapGet("/api/documents/{id}/pages/{page:int}", (string id, int page, PageService pages, DataPaths paths) => pages.Exists(id, page) ? Results.File(paths.Page(id, page), "application/json") : Results.NotFound());
+app.MapGet("/api/documents/{id}/pages/{page:int}/image", async (string id, int page, PageService pages, CancellationToken cancellationToken) =>
+{
+    if (!pages.Exists(id, page)) return Results.NotFound();
+    try { return Results.File(await pages.Render(id, page, cancellationToken), "image/png"); }
+    catch (Exception e) when (e is IOException or System.ComponentModel.Win32Exception or OperationCanceledException) { return Results.Problem("The original page image is unavailable. Use the original PDF link.", statusCode: 503); }
+});
+app.MapGet("/api/figures/{id}/image", (string id, KnowledgeService knowledge, DataPaths paths) =>
+{
+    var figure = (knowledge.Data.Figures ?? []).FirstOrDefault(f => f.Id == id);
+    return figure is not null && File.Exists(paths.Figure(figure.FileName)) ? Results.File(paths.Figure(figure.FileName), "image/png") : Results.NotFound();
+});
 // Static Flutter release files may be placed in wwwroot for one-origin hosting.
 app.MapFallback((HttpContext context) =>
 {
-    if (context.Request.Path.StartsWithSegments("/api")) return Results.NotFound(new ApiError("API route not found."));
+    if (context.Request.Path.StartsWithSegments("/api")) return Results.NotFound(new { error = "API route not found." });
     var index = Path.Combine(app.Environment.WebRootPath ?? Path.Combine(app.Environment.ContentRootPath, "wwwroot"), "index.html");
     return File.Exists(index) ? Results.File(index, "text/html") : Results.NotFound();
 });
