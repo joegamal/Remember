@@ -28,3 +28,23 @@ $array = array($num, $bol, $f_num, $name);
 foreach($array as $item) {
     echo($item . " type: " . gettype($item) . PHP_EOL);
 }
+
+class Person {
+    
+    private $num2 = 10;
+    public $num = 5;
+
+    public function func() {
+        echo "pop \n";
+        echo $this->num . PHP_EOL;
+    }
+
+    public function get_num() {
+        echo $this->num2;
+    }
+}
+
+$obj = new Person;
+$obj->func();
+$obj->get_num();
+
