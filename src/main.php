@@ -31,7 +31,9 @@ foreach($array as $item) {
 
 
 class Base_Person {
-    static $name = "pop";
+    public static $name = "pop";
+
+    public const name = "pop name";
 
     public function __construct(){
         echo "base constructor\n";
@@ -47,7 +49,10 @@ class Person extends Base_Person {
         parent::__construct();
         echo "child constructor\n";
     }
+
+
     private $num2 = 10;
+
     public $num = 5;
 
     private const NUM = 50;
@@ -74,5 +79,7 @@ $obj->get_num();
 
 echo $obj->get_const() . PHP_EOL;
 
-echo Person::PUB_NUM;
+echo Person::PUB_NUM . PHP_EOL;
+
+echo Person::name . PHP_EOL;
 
