@@ -29,22 +29,50 @@ foreach($array as $item) {
     echo($item . " type: " . gettype($item) . PHP_EOL);
 }
 
-class Person {
-    
+
+class Base_Person {
+    static $name = "pop";
+
+    public function __construct(){
+        echo "base constructor\n";
+    }
+} 
+
+
+
+class Person extends Base_Person {
+
+
+    public function __construct() {
+        parent::__construct();
+        echo "child constructor\n";
+    }
     private $num2 = 10;
     public $num = 5;
 
+    private const NUM = 50;
+
+    public const PUB_NUM = 55;
+
     public function func() {
         echo "pop \n";
-        echo $this->num . PHP_EOL;
+        echo $this->num . PHP_EOL;  //this for accessing class properties that defined normally 
     }
 
     public function get_num() {
-        echo $this->num2;
+        echo $this->num2 . PHP_EOL;
+    }
+
+    public function get_const() {
+        return self::NUM;
     }
 }
 
 $obj = new Person;
 $obj->func();
 $obj->get_num();
+
+echo $obj->get_const() . PHP_EOL;
+
+echo Person::PUB_NUM;
 
