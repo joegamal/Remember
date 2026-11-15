@@ -41,6 +41,7 @@ class Base_Person {
 } 
 
 
+// self can be used to access both const and static fields 
 
 class Person extends Base_Person {
 
