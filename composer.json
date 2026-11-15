@@ -1,0 +1,15 @@
+{
+    "name": "yusufgamal/remember",
+    "autoload": {
+        "psr-4": {
+            "Yusufgamal\\Remember\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "joegamal",
+            "email": "yusufmagamalth@gmail.com"
+        }
+    ],
+    "require": {}
+}
