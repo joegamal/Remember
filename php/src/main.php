@@ -83,4 +83,3 @@ echo $obj->get_const() . PHP_EOL;
 echo Person::PUB_NUM . PHP_EOL;
 
 echo Person::name . PHP_EOL;
-
